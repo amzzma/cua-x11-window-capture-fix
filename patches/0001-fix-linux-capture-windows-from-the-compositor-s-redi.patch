@@ -1,0 +1,433 @@
+From f050d2936c84d01632b163192ad4e0bc88e60e73 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness Agent <agent@deepseek-harness.local>
+Date: Thu, 22 Oct 2026 17:26:21 +0800
+Subject: [PATCH 1/2] fix(linux): capture windows from the compositor's
+ redirected frame pixmap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+X11 window managers reparent clients into a frame window, and the compositing
+manager redirects that frame rather than the client. Reading the client drawable
+therefore returns undefined pixels for covered regions; on KWin the covered area
+came back as the occluding window, so a hidden window produced a screenshot of
+whatever happened to cover it.
+
+Try XCompositeNameWindowPixmap first: walk up from the client to the nearest
+redirected ancestor, name its pixmap, and crop the client rectangle with
+translate_coordinates so the delivered frame matches the other backends. The
+request takes a caller-allocated pixmap id and has a void reply, so probes are
+checked requests; a missing compositor or an unredirected window falls through
+to the existing MIT-SHM → XGetImage → ImageMagick cascade.
+
+Verified on KWin 5.27 (X11, gl2 compositing): a Konsole window fully covered by a
+fullscreen Chrome window captures its own terminal content instead of the Chrome
+page. Xvfb without a compositor still captures correctly through the fallback.
+---
+ .../rust/crates/platform-linux/src/capture.rs | 303 +++++++++++++++++-
+ 1 file changed, 294 insertions(+), 9 deletions(-)
+
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/capture.rs b/libs/cua-driver/rust/crates/platform-linux/src/capture.rs
+index b2c0486..b663379 100644
+--- a/libs/cua-driver/rust/crates/platform-linux/src/capture.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/capture.rs
+@@ -1,9 +1,18 @@
+ //! Window screenshot on Linux.
+ //!
+ //! Strategy (in order of preference) for per-window X11 capture:
+-//! 1. Persistent MIT-SHM (`shm_get_image`) via x11rb — warm path, no subprocess
+-//! 2. Persistent plain `XGetImage` via x11rb — still in-process
+-//! 3. `import -window <xid> png:-` (ImageMagick compatibility fallback)
++//! 1. `XCompositeNameWindowPixmap` on the compositor-redirected frame window —
++//!    occlusion-independent, so a covered window still yields its own pixels.
++//!    Falls through when no ancestor is redirected (no compositing manager,
++//!    compositing disabled, or a window the compositor left unredirected).
++//! 2. Persistent MIT-SHM (`shm_get_image`) via x11rb — warm path, no subprocess
++//! 3. Persistent plain `XGetImage` via x11rb — still in-process
++//! 4. `import -window <xid> png:-` (ImageMagick compatibility fallback)
++//!
++//! Window managers reparent clients into a frame window; the compositing
++//! manager redirects the frame, not the client, so the named-pixmap lookup
++//! walks up from the client and crops the frame pixmap back to the client
++//! rectangle (see [`redirected_ancestor`]).
+ //!
+ //! Main-display capture keeps its own dispatch (Wayland cascade → ImageMagick →
+ //! root `XGetImage`). Wayland-native per-window paths are not routed into XShm.
+@@ -38,6 +47,7 @@ const XSHM_INIT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+ pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
+     capture_window_with_backends(
+         xid,
++        capture_via_composite,
+         capture_via_xshm,
+         capture_via_persistent_xgetimage,
+         capture_via_import,
+@@ -53,16 +63,23 @@ pub fn screenshot_window(xid: u64) -> Result<(String, u32, u32)> {
+ 
+ /// Ordered window-capture backend cascade.
+ ///
+-/// Non-empty XShm success returns immediately; otherwise try non-empty
+-/// XGetImage; otherwise ImageMagick. If all fail or return empty, the final
+-/// error preserves all three contexts. Closures are `FnOnce` only (no
+-/// `Send`/`Sync` bounds) so unit tests can drive them with `Rc`/`Cell`.
++/// Non-empty composite success returns immediately; otherwise try non-empty
++/// XShm; otherwise XGetImage; otherwise ImageMagick. If all fail or return
++/// empty, the final error preserves all four contexts. Closures are `FnOnce`
++/// only (no `Send`/`Sync` bounds) so unit tests can drive them with `Rc`/`Cell`.
+ fn capture_window_with_backends(
+     xid: u64,
++    composite: impl FnOnce(u64) -> Result<Vec<u8>>,
+     xshm: impl FnOnce(u64) -> Result<Vec<u8>>,
+     xgetimage: impl FnOnce(u64) -> Result<Vec<u8>>,
+     imagemagick: impl FnOnce(u64) -> Result<Vec<u8>>,
+ ) -> Result<Vec<u8>> {
++    let composite_err = match composite(xid) {
++        Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
++        Ok(_) => "XComposite returned empty image".to_string(),
++        Err(e) => format!("{e:#}"),
++    };
++
+     let xshm_err = match xshm(xid) {
+         Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+         Ok(_) => "XShm returned empty image".to_string(),
+@@ -82,7 +99,7 @@ fn capture_window_with_backends(
+     };
+ 
+     Err(anyhow!(
+-        "all Linux window capture backends failed\n- XShm: {xshm_err}\n- XGetImage: {xgetimage_err}\n- ImageMagick: {imagemagick_err}"
++        "all Linux window capture backends failed\n- XComposite: {composite_err}\n- XShm: {xshm_err}\n- XGetImage: {xgetimage_err}\n- ImageMagick: {imagemagick_err}"
+     ))
+ }
+ 
+@@ -928,6 +945,220 @@ impl XGetImageSession {
+     }
+ }
+ 
++// ── compositor (XComposite) window capture ────────────────────────────────
++
++/// Own connection used only for compositor-backed window capture.
++struct CompositeSession {
++    display: String,
++    conn: x11rb::rust_connection::RustConnection,
++    pixels: PixelCatalog,
++    screen_num: usize,
++}
++
++impl CompositeSession {
++    fn connect(display: String) -> Result<Self> {
++        use x11rb::protocol::composite::ConnectionExt as _;
++
++        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(Some(&display))
++            .map_err(|e| anyhow!("XComposite connect: {e}"))?;
++        let pixels = PixelCatalog::from_setup(conn.setup());
++        conn.composite_query_version(0, 4)
++            .map_err(|e| anyhow!("composite_query_version request: {e}"))?
++            .reply()
++            .map_err(|e| anyhow!("XComposite extension unavailable: {e}"))?;
++        Ok(Self {
++            display,
++            conn,
++            pixels,
++            screen_num,
++        })
++    }
++
++    /// Capture the client content from the compositor's redirected frame
++    /// pixmap. `Ok(None)` means no ancestor is redirected by a compositing
++    /// manager, so the caller falls back to direct drawable capture.
++    fn capture_raw(&mut self, xid: u64) -> Result<Option<RawFrame>> {
++        use x11rb::protocol::composite::ConnectionExt as _;
++        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
++
++        let client = xid_to_window(xid)?;
++        let attrs = self
++            .conn
++            .get_window_attributes(client)
++            .map_err(|e| anyhow!("get_window_attributes request: {e}"))?
++            .reply()
++            .map_err(|e| anyhow!("get_window_attributes reply: {e}"))?;
++        if attrs.visual == 0 {
++            // InputOnly windows have no pixels.
++            return Ok(None);
++        }
++        let geom = self
++            .conn
++            .get_geometry(client)
++            .map_err(|e| anyhow!("get_geometry request: {e}"))?
++            .reply()
++            .map_err(|e| anyhow!("get_geometry reply: {e}"))?;
++        let w = u32::from(geom.width);
++        let h = u32::from(geom.height);
++        checked_capture_dimensions(w, h)?;
++
++        let Some(frame) = redirected_ancestor(&self.conn, client, self.screen_num)? else {
++            return Ok(None);
++        };
++        // The frame pixmap includes the window-manager decoration; crop it back
++        // to the client rectangle so coordinates match the other backends.
++        let offset = self
++            .conn
++            .translate_coordinates(client, frame, 0, 0)
++            .map_err(|e| anyhow!("translate_coordinates request: {e}"))?
++            .reply()
++            .map_err(|e| anyhow!("translate_coordinates reply: {e}"))?;
++        if offset.dst_x < 0 || offset.dst_y < 0 {
++            bail!("client origin is outside its compositor frame");
++        }
++        let pixmap = self
++            .conn
++            .generate_id()
++            .map_err(|e| anyhow!("generate_id for composite capture: {e}"))?;
++        self.conn
++            .composite_name_window_pixmap(frame, pixmap)
++            .map_err(|e| anyhow!("composite_name_window_pixmap request: {e}"))?
++            .check()
++            .map_err(|e| anyhow!("composite_name_window_pixmap reply: {e}"))?;
++        let image = self
++            .conn
++            .get_image(
++                ImageFormat::Z_PIXMAP,
++                pixmap,
++                offset.dst_x,
++                offset.dst_y,
++                geom.width,
++                geom.height,
++                !0u32,
++            )
++            .map_err(|e| anyhow!("get_image request: {e}"))?
++            .reply();
++        self.conn
++            .free_pixmap(pixmap)
++            .map_err(|e| anyhow!("free_pixmap request: {e}"))?;
++        let image = image.map_err(|e| anyhow!("get_image reply: {e}"))?;
++
++        if !matches!(image.depth, 16 | 24 | 32) {
++            bail!("Unsupported depth: {}", image.depth);
++        }
++        Ok(Some(RawFrame {
++            data: image.data,
++            w,
++            h,
++            decoder: self
++                .pixels
++                .decoder(w, h, image.depth, attrs.visual, |visual| {
++                    query_direct_colors(&self.conn, client, visual)
++                })?,
++        }))
++    }
++}
++
++/// Walk up from `client` to the nearest ancestor redirected by the compositor.
++///
++/// X11 window managers reparent clients into a frame window; the compositing
++/// manager redirects that frame rather than the client, so `NameWindowPixmap`
++/// on the client yields `BadMatch`. Returns `None` when no ancestor is
++/// redirected (no compositing manager, compositing disabled, or a window the
++/// compositor left unredirected). Each failed probe is a checked request whose
++/// error x11rb contains, so the connection stays usable.
++fn redirected_ancestor(
++    conn: &x11rb::rust_connection::RustConnection,
++    client: u32,
++    screen_num: usize,
++) -> Result<Option<u32>> {
++    use x11rb::protocol::composite::ConnectionExt as _;
++    use x11rb::protocol::xproto::ConnectionExt as _;
++
++    let root = conn.setup().roots[screen_num].root;
++    let mut current = client;
++    loop {
++        // CompositeNameWindowPixmap names a caller-allocated pixmap id and has a
++        // void reply, so a failed probe is a checked RequestError, not a reply.
++        let probe_pixmap = conn
++            .generate_id()
++            .map_err(|e| anyhow!("generate_id for composite probe: {e}"))?;
++        if conn
++            .composite_name_window_pixmap(current, probe_pixmap)
++            .map_err(|e| anyhow!("composite_name_window_pixmap request: {e}"))?
++            .check()
++            .is_ok()
++        {
++            return Ok(Some(current));
++        }
++        if current == root {
++            return Ok(None);
++        }
++        let parent = conn
++            .query_tree(current)
++            .map_err(|e| anyhow!("query_tree request: {e}"))?
++            .reply()
++            .map_err(|e| anyhow!("query_tree reply: {e}"))?
++            .parent;
++        if parent == 0 || parent == current {
++            return Ok(None);
++        }
++        current = parent;
++    }
++}
++
++fn composite_state() -> &'static Mutex<Option<CompositeSession>> {
++    static STATE: OnceLock<Mutex<Option<CompositeSession>>> = OnceLock::new();
++    STATE.get_or_init(|| Mutex::new(None))
++}
++
++fn capture_via_composite(xid: u64) -> Result<Vec<u8>> {
++    let display = current_display();
++    let mut guard = lock_mutex(composite_state());
++
++    ensure_composite_ready(&mut guard, &display)
++        .map_err(|e| anyhow!("XComposite connect: {e:#}"))?;
++
++    let first = match guard.as_mut() {
++        Some(session) => session.capture_raw(xid),
++        None => Err(anyhow!("internal: XComposite session missing after ensure")),
++    };
++
++    let frame = match first {
++        Ok(Some(frame)) => frame,
++        Ok(None) => bail!("window is not redirected by a compositing manager"),
++        Err(first_err) => {
++            // Cached connection failure → reconnect once.
++            *guard = None;
++            ensure_composite_ready(&mut guard, &display)
++                .map_err(|e| anyhow!("XComposite reconnect after error ({first_err:#}): {e:#}"))?;
++            let session = guard
++                .as_mut()
++                .ok_or_else(|| anyhow!("XComposite session missing after reconnect"))?;
++            match session.capture_raw(xid).map_err(|e| {
++                anyhow!("XComposite capture failed after reconnect (first: {first_err:#}): {e:#}")
++            })? {
++                Some(frame) => frame,
++                None => bail!("window is not redirected by a compositing manager"),
++            }
++        }
++    };
++
++    drop(guard);
++    packed_zpixmap_to_png(&frame.data, frame.w, frame.h, frame.decoder)
++}
++
++fn ensure_composite_ready(guard: &mut Option<CompositeSession>, display: &str) -> Result<()> {
++    if let Some(session) = guard.as_ref() {
++        if session.display == display {
++            return Ok(());
++        }
++    }
++    *guard = None;
++    *guard = Some(CompositeSession::connect(display.to_string())?);
++    Ok(())
++}
++
+ /// Public version of png_dimensions for use in tool code.
+ pub fn png_dimensions_pub(data: &[u8]) -> Result<(u32, u32)> {
+     cua_driver_core::image_utils::png_dimensions(data)
+@@ -1393,17 +1624,19 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn xshm_success_short_circuits_other_linux_capture_backends() {
++    fn xshm_success_short_circuits_after_composite_miss() {
+         use std::rc::Rc;
+ 
+         let png = cua_driver_core::image_utils::encode_rgba_to_png(&[255, 0, 0, 255], 1, 1)
+             .expect("1x1 PNG");
+         assert!(!png.is_empty());
+ 
++        let composite_calls = Rc::new(Cell::new(0u32));
+         let xshm_calls = Rc::new(Cell::new(0u32));
+         let xgetimage_calls = Rc::new(Cell::new(0u32));
+         let imagemagick_calls = Rc::new(Cell::new(0u32));
+ 
++        let composite_calls_c = Rc::clone(&composite_calls);
+         let xshm_calls_c = Rc::clone(&xshm_calls);
+         let xgetimage_calls_c = Rc::clone(&xgetimage_calls);
+         let imagemagick_calls_c = Rc::clone(&imagemagick_calls);
+@@ -1411,6 +1644,11 @@ mod tests {
+ 
+         let result = capture_window_with_backends(
+             42,
++            move |xid| {
++                composite_calls_c.set(composite_calls_c.get() + 1);
++                assert_eq!(xid, 42);
++                Err(anyhow::anyhow!("no compositing manager"))
++            },
+             move |xid| {
+                 xshm_calls_c.set(xshm_calls_c.get() + 1);
+                 assert_eq!(xid, 42);
+@@ -1427,21 +1665,67 @@ mod tests {
+         );
+ 
+         assert_eq!(result.expect("xshm success"), png);
++        assert_eq!(composite_calls.get(), 1);
+         assert_eq!(xshm_calls.get(), 1);
+         assert_eq!(xgetimage_calls.get(), 0);
+         assert_eq!(imagemagick_calls.get(), 0);
+     }
+ 
++    #[test]
++    fn composite_success_short_circuits_other_linux_capture_backends() {
++        use std::rc::Rc;
++
++        let png = cua_driver_core::image_utils::encode_rgba_to_png(&[0, 255, 0, 255], 1, 1)
++            .expect("1x1 PNG");
++        assert!(!png.is_empty());
++
++        let xshm_calls = Rc::new(Cell::new(0u32));
++        let xgetimage_calls = Rc::new(Cell::new(0u32));
++        let imagemagick_calls = Rc::new(Cell::new(0u32));
++
++        let xshm_calls_c = Rc::clone(&xshm_calls);
++        let xgetimage_calls_c = Rc::clone(&xgetimage_calls);
++        let imagemagick_calls_c = Rc::clone(&imagemagick_calls);
++        let png_ret = png.clone();
++
++        let result = capture_window_with_backends(
++            42,
++            move |xid| {
++                assert_eq!(xid, 42);
++                Ok(png_ret)
++            },
++            move |_xid| {
++                xshm_calls_c.set(xshm_calls_c.get() + 1);
++                Err(anyhow::anyhow!("XShm must not be invoked"))
++            },
++            move |_xid| {
++                xgetimage_calls_c.set(xgetimage_calls_c.get() + 1);
++                Err(anyhow::anyhow!("XGetImage must not be invoked"))
++            },
++            move |_xid| {
++                imagemagick_calls_c.set(imagemagick_calls_c.get() + 1);
++                Err(anyhow::anyhow!("ImageMagick must not be invoked"))
++            },
++        );
++
++        assert_eq!(result.expect("composite success"), png);
++        assert_eq!(xshm_calls.get(), 0);
++        assert_eq!(xgetimage_calls.get(), 0);
++        assert_eq!(imagemagick_calls.get(), 0);
++    }
++
+     #[test]
+     fn capture_cascade_preserves_every_backend_error() {
+         let err = capture_window_with_backends(
+             42,
++            |_| Err(anyhow!("no compositing manager")),
+             |_| Err(anyhow!("shm transport disconnected")),
+             |_| Err(anyhow!("get-image bad drawable")),
+             |_| Err(anyhow!("import executable unavailable")),
+         )
+         .expect_err("all failures must be returned");
+         let message = format!("{err:#}");
++        assert!(message.contains("no compositing manager"));
+         assert!(message.contains("shm transport disconnected"));
+         assert!(message.contains("get-image bad drawable"));
+         assert!(message.contains("import executable unavailable"));
+@@ -1452,6 +1736,7 @@ mod tests {
+         let png = vec![1, 2, 3];
+         let result = capture_window_with_backends(
+             42,
++            |_| Err(anyhow!("no compositing manager")),
+             |_| Ok(Vec::new()),
+             |_| Ok(Vec::new()),
+             |_| Ok(png.clone()),
+-- 
+2.55.0
+

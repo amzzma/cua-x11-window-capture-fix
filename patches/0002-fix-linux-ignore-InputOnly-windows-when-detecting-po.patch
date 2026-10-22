@@ -1,0 +1,36 @@
+From 09ddbb2c13ace88fed4942385f89c4240ca6ad62 Mon Sep 17 00:00:00 2001
+From: DeepSeek Harness Agent <agent@deepseek-harness.local>
+Date: Thu, 22 Oct 2026 17:26:21 +0800
+Subject: [PATCH 2/2] fix(linux): ignore InputOnly windows when detecting
+ popups
+
+InputOnly windows have no pixels, so they can never be a visible menu or
+popover. The driver's own cursor/input windows are override-redirect
+InputOnly; counting one as a popup made every window it spans look covered,
+which diverted get_window_state to a screen grab and defeated window-level
+capture even when the compositor had redirected the target window.
+---
+ .../cua-driver/rust/crates/platform-linux/src/input/mod.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/input/mod.rs b/libs/cua-driver/rust/crates/platform-linux/src/input/mod.rs
+index f382aee..b7a7fdb 100644
+--- a/libs/cua-driver/rust/crates/platform-linux/src/input/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/input/mod.rs
+@@ -1937,6 +1937,13 @@ fn popup_info(display: *mut x11::xlib::Display, child: x11::xlib::Window) -> Opt
+     if attrs.width <= 1 || attrs.height <= 1 {
+         return None;
+     }
++    // InputOnly windows have no pixels, so they can never be a visible menu or
++    // popover. The driver's own cursor/input windows are override-redirect
++    // InputOnly; counting one as a popup would make every window it spans look
++    // covered and divert window capture to a screen grab.
++    if attrs.class == x11::xlib::InputOnly {
++        return None;
++    }
+     let pid = window_or_child_pid(display, child);
+     Some(PopupWindow {
+         window: child,
+-- 
+2.55.0
+
